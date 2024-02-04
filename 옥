@@ -1,0 +1,178 @@
+- 👀 옥션 L2 키워드에 대한 pouductgroup 소분류 매핑 SQL 쿼리
+
+WITH paub as (
+    select metropolis.udf_parse_pageid(protocol, host, path, querystring, hashtag, page_value['is_iframe'], ins_date, user_agent, cast( pageid_info['meta_version'] as int) ) as pa,
+    case
+        when host like 'com.ebay.kr.gmarket.%' then 'com.ebay.kr.gmarket'
+        when host like 'kr.co.gmarket.gmktip.%' then 'kr.co.gmarket.gmktip'
+    else host
+    end as host2,
+    *
+    from default.ub_page_event_v2_iac_reg   -- 조회하려는 테이블 (GMKT, IAC)
+    where dt >= ${dt1} and dt <= ${dt2}  -- 조회일자
+        and length(cookie['cguid']) = 26
+        --and hour = 10
+), 
+paub_view as (
+    select metropolis.udf_parse_pageid(protocol, host, path, querystring, hashtag, page_value['is_iframe'], ins_date, user_agent, cast( pageid_info['meta_version'] as int)) as pa,
+    *,
+    trim(default.udf_url_decode(
+        CASE WHEN page_value['original_keyword'] is not null THEN page_value['original_keyword']
+            WHEN page_value['keyword'] is not null THEN page_value['keyword']
+            WHEN querystring['keyword'] is not null THEN querystring['keyword']
+        ELSE '' END , 'utf-8')) as keyword
+    from default.ub_page_view_v2_iac_reg   -- 조회하려는 테이블 (GMKT, IAC)
+    where dt >= ${dt1} and dt <= ${dt2} --and hour = 09 -- 조회하려는 일자 및 시간 (hour는 Optional)     
+      and length(cookie['cguid'])=26
+),
+paub_keyword as(
+    select metropolis.udf_parse_pageid(protocol, host, path, querystring, hashtag, page_value['is_iframe'], ins_date, user_agent, cast( pageid_info['meta_version'] as int)) as pa,
+    *,
+    trim(default.udf_url_decode(
+        CASE WHEN page_value['original_keyword'] is not null THEN page_value['original_keyword']
+            WHEN page_value['keyword'] is not null THEN page_value['keyword']
+            WHEN querystring['keyword'] is not null THEN querystring['keyword']
+        ELSE '' END , 'utf-8')) as keyword,
+    CASE WHEN lower(page_value['is_filtered']) = 'false' -- v2만 is_filtered가 존재함
+        and page_value['convert_type'] in (0, 200) THEN CAST(NVL(page_value['item_count'], 0) as BIGINT)  -- 화면전환 x
+    WHEN lower(page_value['is_filtered']) = 'false' and page_value['convert_type'] in (100, 101) THEN 0  -- 화면전환 o
+    ELSE NULL END as item_count
+    from default.ub_page_view_v2_iac_reg   -- 조회하려는 테이블 (GMKT, IAC)
+    where dt >= ${dt1} and dt <= ${dt2} --and hour = 09 -- 조회하려는 일자 및 시간 (hour는 Optional)     
+      and length(cookie['cguid'])=26
+),
+kwdlevel as
+(select *
+    from (
+        select
+        keyword,                       -- PV Count
+        count(distinct session_id) as ss_cnt
+        from paub_keyword
+        where pa.standard = true -- 표준 기준
+            and pa.depth1_name = 'LP/SRP' 
+            and pa.depth2_name = 'SRP'
+        group by keyword
+) a 
+where ss_cnt >= 20
+)
+
+
+SELECT tt.keyword ,srp.pv, srp.ss_cnt,tt.gdlc_cd, tt.gdlc_nm, tt.gdmc_cd, tt.gdmc_nm, tt.gdsc_cd, tt.gdsc_nm,
+tt.click_cnt, tt.se_cnt, tt.gmv, tt.kwdClick_tot, tt.percetage
+FROM kwdlevel
+LEFT JOIN ( 
+    SELECT t.keyword keyword
+        , t.assort_code
+        , t.click_cnt click_cnt
+        , t.se_cnt se_cnt
+        , nvl(t.gmv,0) gmv
+        , sum(t.click_cnt) OVER (PARTITION BY t.keyword) as kwdClick_tot
+        , round(t.click_cnt/sum(t.click_cnt) OVER (PARTITION BY t.keyword), 2) percetage
+    FROM (
+            select 
+                a.keyword -- a.dt, a.itemno1
+                , assort_code
+                , count(*) as click_cnt -- SRP Click 수
+                , count(distinct case when click_id2 is not null then click_id2 else 0 end) as se_cnt -- SE 수
+                , count(distinct case when c.ono is not null then c.ono else 0 end) as ono_cnt -- 주문 수
+                , sum(gmv) as gmv -- GMV
+            from (
+                select
+                    dt,
+                    lower(area_value['itemno']) as itemno1,
+                    cookie['cguid'] as cguid1,
+                    area_value['click_id'] as click_id1,
+                    
+                    -- keyword
+                    trim(default.udf_url_decode(
+                        CASE WHEN area_value['keyword'] is not null THEN area_value['keyword'] 
+                            WHEN page_value['original_keyword'] is not null THEN page_value['original_keyword']
+                            WHEN querystring['keyword'] is not null THEN querystring['keyword']
+                        ELSE '' END, 'utf-8')) as keyword
+                from paub
+                where (concat(host2,path) in (select concat(host,path) from search_analytics.t2t_srp_url where site='IAC')) -- SRP Total (Meta + Ad-hoc) URL
+                    and lower(action) = 'click'
+                    and lower(area_type) = 'item'
+                group by dt, lower(area_value['itemno']), cookie['cguid'], area_value['click_id'],
+                        trim(default.udf_url_decode(
+                            CASE WHEN area_value['keyword'] is not null THEN area_value['keyword'] 
+                                WHEN page_value['original_keyword'] is not null THEN page_value['original_keyword']
+                                WHEN querystring['keyword'] is not null THEN querystring['keyword']
+                            ELSE '' END, 'utf-8'))
+                ) a
+            -- group by dt, keyword, goodscode
+            
+            left join (-- SE 
+                select
+                    dt,  
+                    get_json_object(area_value['click_info'], '$.area_code') as area_code,
+                    lower(get_json_object(area_value['click_info'], '$.itemno')) as itemno2,
+                    cookie['cguid'] as cguid2,
+                    get_json_object(area_value['click_info'], '$.click_id') as click_id2,
+                    lower(cno1) as cno1
+                from paub
+                    lateral view explode(split(area_value['cno'],',')) cno1 as cno1 
+                where lower(area_type) = 'buy'
+                group by
+                    dt,  
+                    get_json_object(area_value['click_info'], '$.area_code'),
+                    lower(get_json_object(area_value['click_info'], '$.itemno')),
+                    cookie['cguid'],
+                    get_json_object(area_value['click_info'], '$.click_id'),
+                    lower(cno1)
+                ) b on a.click_id1 = b.click_id2 and a.itemno1 = b.itemno2 and a.cguid1 = b.cguid2 and a.dt = b.dt
+            
+            left join (-- Order Complete
+                select
+                    dt,   
+                    ono,
+                    lower(area_value['cno']) as cno2,
+                    cookie['cguid'] as cguid3
+                from paub
+                    lateral view explode(split(area_value['ono'],',')) ono as ono
+                where lower(area_code) = 'op'
+                group by
+                    dt,   
+                    ono,
+                    lower(area_value['cno']),
+                    cookie['cguid']
+                ) c on b.cno1 = c.cno2
+                
+            left join (-- GMV
+                select
+                    order_no
+                    , sum(pay_gmv+pay_total_seller_cp) as gmv
+                    --, sum(pay_nfvf) as nfvf
+                from baikal_transaction.auction_pay 
+                where dt >= ${dt1} and dt <= ${dt2}  -- 조회일자
+                group by order_no
+            ) e 
+            
+            LEFT JOIN (
+                SELECT goods.gd_no gd_no
+                FROM baikal_transaction.goods
+                LEFT JOIN (SELECT gdlc_cd, gdlc_nm FROM baikal_transaction.gdlc) lc on goods.gdlc_cd=lc.gdlc_cd
+                LEFT JOIN baikal_transaction.gdmc mc on goods.gdmc_cd = mc.gdmc_cd
+                LEFT JOIN baikal_transaction.gdsc sc on goods.gdsc_cd = sc.gdsc_cd
+            ) glc on a.goodscode1=glc.gd_no
+            GROUP BY a.keyword, glc.gdlc_cd, glc.gdlc_nm, glc.gdmc_cd, glc.gdmc_nm, glc.gdsc_cd, glc.gdsc_nm -- a.dt, a.goodscode1,
+    )t 
+)tt on kwdlevel.keyword = tt.keyword
+LEFT JOIN (
+    select
+    keyword,
+    --avg(item_count) as item_cnt,
+    count(*) as pv,                         -- PV Count
+    --count(distinct cookie['cguid']) as uv,  -- UV Count
+    count(distinct session_id) as ss_cnt
+    from paub_view
+    where pa.standard = true -- 표준 기준
+        and pa.depth1_name = 'LP/SRP' 
+        and pa.depth2_name = 'SRP'
+    group by keyword
+) srp on kwdlevel.keyword = srp.keyword
+WHERE tt.click_cnt >= 30 and tt.percetage >= 0.01 --kwdlevel.kwd_Level = 'L2' and tt.click_cnt >= 30 and tt.percetage >= 0.01
+
+-- ) ev on iv.dt=ev.dt and iv.goodscode=ev.goodscode1 and iv.keyword_imp=ev.keyword
+
+-- group by iv.dt, iv.keyword_imp, iv.gdlc_nm
