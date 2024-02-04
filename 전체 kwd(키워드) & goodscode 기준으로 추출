@@ -1,0 +1,153 @@
+- 👀 전체 kwd(키워드) & goodscode 기준으로 추출하는 SQL 코드
+
+WITH paub as (
+    select metropolis.udf_parse_pageid(protocol, host, path, querystring, hashtag, page_value['is_iframe'], ins_date, user_agent, cast( pageid_info['meta_version'] as int) ) as pa,
+    case
+        when host like 'com.ebay.kr.gmarket.%' then 'com.ebay.kr.gmarket'
+        when host like 'kr.co.gmarket.gmktip.%' then 'kr.co.gmarket.gmktip'
+    else host
+    end as host2,
+    *
+    from default.ub_page_event_v2_gmkt_reg   -- 조회하려는 테이블 (GMKT, IAC)
+    where dt >= ${dt1} and dt<= ${dt2} -- 조회일자
+        and length(cookie['cguid']) = 26
+),
+pv as (
+    select metropolis.udf_parse_pageid(protocol, host, path, querystring, hashtag, page_value['is_iframe'], ins_date, user_agent, cast( pageid_info['meta_version'] as int) ) as pa,
+    case
+        when host like 'com.ebay.kr.gmarket.%' then 'com.ebay.kr.gmarket'
+        when host like 'kr.co.gmarket.gmktip.%' then 'kr.co.gmarket.gmktip'
+    else host
+    end as host2,
+    *
+    from default.ub_page_view_v2_gmkt_reg   -- 조회하려는 테이블 (GMKT, IAC)
+    where dt >= ${dt1} and dt<= ${dt2} -- 조회일자
+        and length(cookie['cguid']) = 26
+),
+imp as (
+    select dt 
+        , str_to_map(regexp_replace(items,'\\[|\\{|\\]|\\}|\\"','')) items
+        , case
+            when host like 'com.ebay.kr.gmarket.%' then 'com.ebay.kr.gmarket'
+            when host like 'kr.co.gmarket.gmktip.%' then 'kr.co.gmarket.gmktip'
+        else host
+        end as host2
+        , path
+    from default.ub_page_impression_v2_gmkt_reg
+        lateral view explode(split(area_value['itemlist'],'},')) z as items
+    where dt >= ${dt1} and dt<= ${dt2} -- 조회일자
+        and length(cookie['cguid']) = 26
+        and lower(area_type) = 'item'
+)
+
+SELECT i.keyword as keyword,
+    i.goodscode as goodscode,
+    i.imp as imp_total,
+    nvl(event.click_cnt, 0) as click_cnt,
+    nvl(event.se_cnt, 0) as se_snt,
+    nvl(event.order_cnt, 0) as order_cnt,
+    nvl(event.order_amnt_total, 0) as order_amnt_total,
+    nvl(event.order_quantity_total, 0) as order_quantity_total
+FROM (
+    SELECT iu.keyword as keyword
+        , iu.goodscode as goodscode
+        , sum(iu.imp) as imp
+    FROM (
+        
+        -- SRP Item 2.0 Impression
+        select items['keyword'] keyword
+            , items['goodscode'] goodscode
+            , count(*) imp
+        from imp
+        where (concat(imp.host2,imp.path) in (select concat(host,path) from search_analytics.t2t_srp_url where site='GMKT'))
+        GROUP BY items['keyword'], items['goodscode']
+        
+        UNION ALL 
+        
+        select str_to_map(regexp_replace(items,'\\[|\\{|\\]|\\}|\\"',''))['keyword'] as keyword
+            , str_to_map(regexp_replace(items,'\\[|\\{|\\]|\\}|\\"',''))['goodscode'] as goodscode
+            , count(*) imp
+        from paub
+            lateral view explode(split(area_value['itemlist'],'},')) z as items
+        where (concat(paub.host2,paub.path) in (select concat(host,path) from search_analytics.t2t_srp_url where site='GMKT')) -- SRP Ad-hoc URL
+            and lower(action) = 'click_view'
+            and lower(area_type) = 'item'
+        group by dt
+                , str_to_map(regexp_replace( items,'\\[|\\{|\\]|\\}|\\"',''))['keyword']
+                , str_to_map(regexp_replace(items,'\\[|\\{|\\]|\\}|\\"',''))['goodscode']
+    ) iu
+    where iu.keyword is not null and iu.keyword<>''
+    group by iu.keyword, iu.goodscode
+) i
+
+left join ( 
+
+    select 
+        a.keyword as keyword,
+        a.goodscode1 as goodscode,
+        count(*) as click_cnt, -- 전체 SRP Click 수
+        count(distinct case when b.click_id2 is not null then b.click_id2 end) as se_cnt, -- SE 수
+        count(distinct case when c.ono is not null then c.ono end) as order_cnt, -- 주문 수
+        NVL(sum(c.order_amnt), 0) as order_amnt_total,
+        NVL(sum(c.order_quantity), 0) as order_quantity_total
+
+    from (
+        select
+            trim(default.udf_url_decode(
+                CASE WHEN area_value['keyword'] is not null THEN area_value['keyword'] 
+                    WHEN page_value['original_keyword'] is not null THEN page_value['original_keyword']
+                    WHEN querystring['keyword'] is not null THEN querystring['keyword']
+                ELSE '' END, 'utf-8')) as keyword,
+            lower(area_value['goodscode']) as goodscode1,
+            cookie['cguid'] as cguid1,
+            area_value['click_id'] as click_id1,
+            -- area_value,
+            session_id
+        from paub
+        where (concat(host2,path) in (select concat(host,path) from search_analytics.t2t_srp_url where site='GMKT')) -- SRP Total (Meta + Ad-hoc) URL
+            and lower(action) = 'click'
+            and lower(area_type) = 'item'
+            and (area_value['original_keyword'] is not null or area_value['keyword'] is not null)
+        group by
+            CASE WHEN area_value['keyword'] is not null THEN area_value['keyword'] 
+                    WHEN page_value['original_keyword'] is not null THEN page_value['original_keyword']
+                    WHEN querystring['keyword'] is not null THEN querystring['keyword']
+                ELSE '' END,
+            lower(area_value['goodscode']),
+            cookie['cguid'],
+            area_value['click_id'],
+            area_value,
+            session_id
+    ) a -- click
+    
+    left join (-- SE  
+            select
+                get_json_object(area_value['click_info'], '$.area_code') as area_code,
+                lower(get_json_object(area_value['click_info'], '$.goodscode')) as goodscode2,
+                cookie['cguid'] as cguid2,
+                get_json_object(area_value['click_info'], '$.click_id') as click_id2,
+                lower(cno1) as cno1
+            from paub
+                lateral view explode(split(area_value['cno'],',')) cno1 as cno1 
+            where lower(area_type) = 'buy'
+            group by 
+                get_json_object(area_value['click_info'], '$.area_code'),
+                lower(get_json_object(area_value['click_info'], '$.goodscode')),
+                cookie['cguid'],
+                get_json_object(area_value['click_info'], '$.click_id'),
+                lower(cno1)
+    ) b on a.click_id1 = b.click_id2 and a.goodscode1 = b.goodscode2 and a.cguid1 = b.cguid2
+        
+    left join (-- Order Complete   
+        select 
+            DISTINCT ono
+            , lower(area_value['cno']) as cno2
+            , cookie['cguid'] as cguid3
+            , (area_value['oamnt'] + area_value['pamnt'] + area_value['damnt']) as order_amnt
+            , area_value['oqty'] as order_quantity -- 주문수량
+        from paub
+            lateral view explode(split(area_value['ono'],',')) ono as ono
+        where lower(area_code) = 'op'
+    ) c on b.cno1 = c.cno2
+    GROUP BY a.keyword, a.goodscode1
+) event on i.keyword=event.keyword and i.goodscode=event.goodscode
