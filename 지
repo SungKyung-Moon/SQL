@@ -1,0 +1,102 @@
+- 👀 지마켓 search_kwd dt 지정 SQL 쿼리
+
+WITH paub as (
+    select metropolis.udf_parse_pageid(protocol, host, path, querystring, hashtag, page_value['is_iframe'], ins_date, user_agent, cast( pageid_info['meta_version'] as int) ) as pa,
+        *
+    from default.ub_page_view_v2_gmkt_reg   -- 조회하려는 테이블 (GMKT, IAC)
+    where dt >= ${dt1} and dt <= ${dt2}
+        and length(cookie['cguid']) = 26
+)
+
+, paub_e as (
+    select metropolis.udf_parse_pageid(protocol, host, path, querystring, hashtag, page_value['is_iframe'], ins_date, user_agent, cast( pageid_info['meta_version'] as int) ) as pa,
+    case
+        when host like 'com.ebay.kr.gmarket.%' then 'com.ebay.kr.gmarket'
+        when host like 'kr.co.gmarket.gmktip.%' then 'kr.co.gmarket.gmktip'
+    else host
+    end as host2,
+    *
+    from default.ub_page_event_v2_gmkt_reg   -- 조회하려는 테이블 (GMKT, IAC)
+    where dt >= ${dt1} and dt <= ${dt2}
+        and length(cookie['cguid']) = 26
+        and lower(action) = 'click'
+        and lower(area_type) = 'item'
+)
+
+INSERT OVERWRITE TABLE search_analytics.g_search_kwd
+partition (dt)
+
+SELECT g.keyword as keyword
+    , g.platform as platform
+    , g.item_count_avg as item_count_avg
+    , g.item_count_min as item_count_min
+    , g.item_count_max as item_count_max
+    , g.pv_total as pv
+    , g.uv_total as uv
+    , g.ss_total as ss
+    , NVL(e.clicks, 0) as clicks
+    , g.hour as hour
+    , g.dt as dt
+
+FROM (
+    SELECT 
+        v.keyword as keyword
+        , v.platform as platform
+        , ROUND(AVG(v.item_count)) as item_count_avg
+        , min(v.item_count) as item_count_min
+        , max(v.item_count) as item_count_max
+        , count(*) as pv_total
+        , count(distinct v.cguid) as uv_total
+        , count(distinct v.session_id) as ss_total
+        , v.hour as hour
+        , v.dt as dt
+    FROM (
+        SELECT
+            -- Keyword
+            trim(regexp_replace(default.udf_url_decode(
+                CASE WHEN page_value['original_keyword'] is not null THEN page_value['original_keyword']
+                    WHEN page_value['keyword'] is not null THEN page_value['keyword']
+                    WHEN querystring['keyword'] is not null THEN querystring['keyword']
+                ELSE '' END , 'utf-8'), '|\n|\r', ' ')) as keyword
+            , pa.original_platform as platform
+            , CASE WHEN lower(page_value['is_filtered']) = 'false' -- v2만 is_filtered가 존재함
+                        and page_value['convert_type'] in (0, 200) THEN CAST(NVL(page_value['item_count'], 0) as BIGINT)  -- 화면전환 x
+                    WHEN lower(page_value['is_filtered']) = 'false' and page_value['convert_type'] in (100, 101) THEN 0  -- 화면전환 o
+                ELSE NULL END as item_count
+            , cookie['cguid'] as cguid
+            , session_id
+            , hour
+            , dt
+        FROM paub
+        WHERE pa.standard = true -- 표준 기준
+            and pa.depth1_name = 'LP/SRP'                   -- Depth1 명 (depth1명으로 집계시, LP/SRP)
+            and pa.depth2_name = 'SRP'               -- Depth2 명 (depth2명으로 집계시, SRP)
+    ) v
+    GROUP BY v.dt, v.hour, v.platform, v.keyword
+) g
+
+LEFT JOIN (
+    SELECT 
+        click.keyword as keyword
+        , count(*) as clicks
+        , click.platform as platform
+        , click.hour as hour
+        , click.dt as dt
+    
+    FROM (
+        SELECT
+            -- Keyword
+            trim(regexp_replace(default.udf_url_decode(
+                CASE WHEN area_value['keyword'] is not null THEN area_value['keyword']
+                    WHEN page_value['original_keyword'] is not null THEN page_value['original_keyword']
+                    WHEN querystring['keyword'] is not null THEN querystring['keyword']
+                    ELSE '' END, 'utf-8'), '|\n|\r', ' ')) as keyword
+            , pa.original_platform as platform
+            , area_value['click_id'] as click_id
+            , hour
+            , dt
+          FROM paub_e
+          WHERE (concat(host2,path) in (select concat(host,path) from search_analytics.t2t_srp_url)) -- SRP Total (Meta + Ad-hoc) URL
+        ) click
+    GROUP BY click.dt, click.hour, click.platform, click.keyword
+) e on g.dt = e.dt and g.hour = e.hour and g.keyword = e.keyword and g.platform = e.platform
