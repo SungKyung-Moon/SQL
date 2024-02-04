@@ -1,0 +1,149 @@
+- 👀 지마켓 no_result_kwd dt 지정 쿼리
+
+WITH paub as (
+    select metropolis.udf_parse_pageid(protocol, host, path, querystring, hashtag, page_value['is_iframe'], ins_date, user_agent, cast( pageid_info['meta_version'] as int) ) as pa,
+        *
+    from default.ub_page_view_v2_gmkt_reg   -- 조회하려는 테이블 (GMKT, IAC)
+    where dt>=${dt1} and dt<=${dt2} -- 조회일자
+        and length(cookie['cguid']) = 26
+)
+ 
+, paub_e as (
+    select metropolis.udf_parse_pageid(protocol, host, path, querystring, hashtag, page_value['is_iframe'], ins_date, user_agent, cast( pageid_info['meta_version'] as int) ) as pa,
+    case
+        when host like 'com.ebay.kr.gmarket.%' then 'com.ebay.kr.gmarket'
+        when host like 'kr.co.gmarket.gmktip.%' then 'kr.co.gmarket.gmktip'
+    else host
+    end as host2,
+    *
+    from default.ub_page_event_v2_gmkt_reg   -- 조회하려는 테이블 (GMKT, IAC)
+    where dt>=${dt1} and dt<=${dt2} -- 조회일자
+        and length(cookie['cguid']) = 26
+        and lower(action) = 'click'
+        and lower(area_type) = 'item'
+)
+
+-- 테이블에 넣기
+INSERT OVERWRITE TABLE search_analytics.g_no_result_kwd
+partition (dt)
+
+SELECT  g.original_keyword as original_keyword
+    , g.suggested_keyword as suggested_keyword
+    , g.convert_type as convert_type
+    , g.convert_reason_type as convert_reason_type
+    , g.convert_type_name as convert_type_name
+    , round(avg(g.item_count_avg)) as item_count_avg
+    , min(g.item_count_min) as item_count_min
+    , max(g.item_count_max) as item_count_max
+    , sum(g.pv_total) as pv
+    , sum(g.uv_total) as uv
+    , sum(g.ss_total) as ss
+    , NVL(sum(e.clicks), 0) as clicks
+    , g.platform as platform
+    , g.hour as hour
+    , g.dt as dt
+FROM (
+    SELECT v.original_keyword as original_keyword
+            , v.suggested_keyword as suggested_keyword
+            , v.convert_type as convert_type
+            , v.convert_reason_type as convert_reason_type
+            , v.convert_type_name as convert_type_name
+            , v.session_id as session_id
+            , ROUND(AVG(v.item_count)) as item_count_avg
+            , min(v.item_count) as item_count_min
+            , max(v.item_count) as item_count_max
+            , count(*) as pv_total
+            , count(distinct v.cguid) as uv_total
+            , count(distinct v.session_id) as ss_total
+            , v.platform as platform
+            , v.hour as hour
+            , v.dt as dt
+    FROM (
+        SELECT a.original_keyword as original_keyword
+            , nvl(a.suggested_keyword, a.original_keyword) as suggested_keyword
+            , a.convert_type as convert_type
+            , a.convert_reason_type as convert_reason_type
+            , CASE WHEN (a.convert_type=100 and a.convert_reason_type=300) THEN 'Convert_Only_Replace'
+                    WHEN (a.convert_type=100 and a.convert_reason_type=200) THEN 'Convert_Only_Correct'
+                    WHEN (a.convert_type=101 and a.convert_reason_type=100) THEN 'Convert_And_Suggest_Language_Change'
+                    WHEN (a.convert_type=101 and a.convert_reason_type=200) THEN 'Convert_And_Suggest_Correct'
+                    WHEN (a.convert_type=200 and a.convert_reason_type=200) THEN 'Not_Convert_And_Suggest_Correct'
+                    WHEN (a.convert_type=200 and a.convert_reason_type=300) THEN 'Not_Convert_And_Suggest_Replace'
+                    WHEN (a.convert_type=0 and a.convert_reason_type=0) THEN 'Not_Convert'
+                END as convert_type_name
+            , a.item_count as item_count
+            , a.session_id as session_id
+            , a.cguid as cguid
+            , a.platform as platform
+            , a.hour as hour
+            , a.dt as dt
+        FROM 
+            (
+            SELECT
+                -- Keyword
+                trim(regexp_replace(default.udf_url_decode(
+                    CASE WHEN page_value['original_keyword'] is not null THEN page_value['original_keyword']
+                        WHEN page_value['keyword'] is not null THEN page_value['keyword']
+                        WHEN querystring['keyword'] is not null THEN querystring['keyword']
+                    ELSE '' END , 'utf-8'), '|\n|\r', ' ')) as original_keyword
+                , trim(regexp_replace(default.udf_url_decode(page_value['suggested_keyword'], 'utf-8'), '|\n|\r', ' ')) as suggested_keyword
+                , nvl(page_value['convert_type'], 0) as convert_type
+                , nvl(page_value['convert_reason_type'], 0) as convert_reason_type
+                , CASE WHEN lower(page_value['is_filtered']) = 'false' -- v2만 is_filtered가 존재함
+                            and page_value['convert_type'] in (0, 200) THEN CAST(NVL(page_value['item_count'], 0) as BIGINT)  -- 화면전환 x
+                        WHEN lower(page_value['is_filtered']) = 'false' and page_value['convert_type'] in (100, 101) THEN 0  -- 화면전환 o
+                    ELSE NULL END as item_count
+                , cookie['cguid'] as cguid
+                , session_id
+                , pa.original_platform as platform
+                , hour
+                , dt
+            FROM paub
+            WHERE pa.standard = true -- 표준 기준
+                and pa.depth1_name = 'LP/SRP'                   -- Depth1 명 (depth1명으로 집계시, LP/SRP)
+                and pa.depth2_name = 'SRP'               -- Depth2 명 (depth2명으로 집계시, SRP)
+            ) a
+        ) v
+    GROUP BY v.original_keyword, v.suggested_keyword, v.convert_type, v.convert_reason_type, v.convert_type_name, v.session_id, v.platform, v.hour, v.dt
+) g
+
+LEFT JOIN (
+    SELECT c.original_keyword as original_keyword
+        , c.suggested_keyword as suggested_keyword
+        , c.session_id as session_id
+        , count(*) as clicks
+        , c.platform as platform
+        , c.hour as hour
+        , c.dt as dt
+    FROM (
+        SELECT b.original_keyword as original_keyword
+            , nvl(b.suggested_keyword, b.original_keyword) as suggested_keyword
+            , b.session_id as session_id
+            , b.platform as platform
+            , b.hour as hour
+            , b.dt as dt
+        FROM (
+            SELECT
+                -- Keyword
+                trim(regexp_replace(default.udf_url_decode(
+                CASE WHEN area_value['keyword'] is not null THEN area_value['keyword']
+                    WHEN page_value['original_keyword'] is not null THEN page_value['original_keyword']
+                    WHEN querystring['keyword'] is not null THEN querystring['keyword']
+                    ELSE '' END, 'utf-8'), '|\n|\r', ' ')) as original_keyword
+                , trim(regexp_replace(default.udf_url_decode(
+                    CASE WHEN area_value['suggested_keyword'] is not null THEN area_value['suggested_keyword']
+                        WHEN page_value['suggested_keyword'] is not null THEN page_value['suggested_keyword']
+                    ELSE NULL END, 'utf-8'), '|\n|\r', ' ')) as suggested_keyword
+                , session_id
+                , area_value['click_id'] as click_id
+                , pa.original_platform as platform
+                , hour
+                , dt
+              FROM paub_e
+              WHERE (concat(host2,path) in (select concat(host,path) from search_analytics.t2t_srp_url)) -- SRP Total (Meta + Ad-hoc) URL
+            ) b
+        ) c
+    GROUP BY c.original_keyword, c.suggested_keyword, c.session_id, c.platform, c.hour, c.dt
+) e on g.original_keyword = e.original_keyword and g.suggested_keyword = e.suggested_keyword and g.session_id = e.session_id 
+    and g.platform = e.platform and g.hour = e.hour and g.dt = e.dt
+GROUP BY g.original_keyword, g.suggested_keyword, g.convert_type, g.convert_reason_type, g.convert_type_name, g.platform, g.hour, g.dt 
